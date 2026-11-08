@@ -3695,6 +3695,50 @@ pub fn outer_rect_in_points(window: &Window, pixels_per_point: f32) -> Option<Re
     Some(outer_rect_px / pixels_per_point)
 }
 
+/// The monitor's size in pixels, or `None` if it has just gone away.
+///
+/// On Windows, `MonitorHandle::size` panics when `GetMonitorInfoW` refuses the handle
+/// (`ERROR_INVALID_MONITOR_HANDLE`), which happens as displays are unplugged, turned off or
+/// rearranged. This runs every frame, so that ended the whole program
+/// (rust-windowing/winit#3102).
+#[cfg(target_os = "windows")]
+fn monitor_size_in_pixels(
+    monitor: &winit::monitor::MonitorHandle,
+) -> Option<winit::dpi::PhysicalSize<u32>> {
+    use winit::platform::windows::MonitorHandleExtWindows as _;
+
+    // winit's `windows-sys` has its own `HMONITOR` type; the handle is the same value.
+    hmonitor_size_in_pixels(monitor.hmonitor() as _)
+}
+
+#[cfg(target_os = "windows")]
+fn hmonitor_size_in_pixels(
+    hmonitor: windows_sys::Win32::Graphics::Gdi::HMONITOR,
+) -> Option<winit::dpi::PhysicalSize<u32>> {
+    use windows_sys::Win32::Graphics::Gdi::{GetMonitorInfoW, MONITORINFO};
+
+    // SAFETY: MONITORINFO is plain data, valid when zeroed; `cbSize` says which structure it is,
+    // and GetMonitorInfoW only writes to it. A stale `hmonitor` makes the call return FALSE.
+    #[expect(unsafe_code)]
+    let info = unsafe {
+        let mut info: MONITORINFO = std::mem::zeroed();
+        info.cbSize = size_of::<MONITORINFO>() as u32;
+        (GetMonitorInfoW(hmonitor, &raw mut info) != 0).then_some(info)
+    }?;
+    let rect = info.rcMonitor;
+    Some(winit::dpi::PhysicalSize::new(
+        (rect.right - rect.left) as u32,
+        (rect.bottom - rect.top) as u32,
+    ))
+}
+
+#[cfg(not(target_os = "windows"))]
+fn monitor_size_in_pixels(
+    monitor: &winit::monitor::MonitorHandle,
+) -> Option<winit::dpi::PhysicalSize<u32>> {
+    Some(monitor.size())
+}
+
 /// Update the given viewport info with the current state of the window.
 ///
 /// Call before [`State::take_egui_input`].
@@ -3728,12 +3772,13 @@ pub fn update_viewport_info(
 
     let monitor_size = {
         profiling::scope!("monitor_size");
-        if let Some(monitor) = window.current_monitor() {
-            let size = monitor.size().to_logical::<f32>(pixels_per_point.into());
-            Some(egui::vec2(size.width, size.height))
-        } else {
-            None
-        }
+        window
+            .current_monitor()
+            .and_then(|monitor| monitor_size_in_pixels(&monitor))
+            .map(|size| {
+                let size = size.to_logical::<f32>(pixels_per_point.into());
+                egui::vec2(size.width, size.height)
+            })
     };
 
     viewport_info.title = Some(window.title());
@@ -5163,6 +5208,14 @@ pub fn short_window_event_description(event: &winit::event::WindowEvent) -> &'st
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A monitor handle Windows no longer knows (ERROR_INVALID_MONITOR_HANDLE) has no size:
+    /// the call that used to end the program, in `update_viewport_info`.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn a_monitor_that_is_gone_has_no_size() {
+        assert_eq!(super::hmonitor_size_in_pixels(0xDEAD_BEEF_usize as _), None);
+    }
 
     #[test]
     fn destroyed_window_resets_ime_cursor_purpose_and_allow_on_every_platform() {

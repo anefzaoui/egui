@@ -29,6 +29,79 @@ use crate::clipboard_bridge::{
     PasteTransfer,
 };
 
+/// How long egui waits for another use of the system clipboard in this process to end
+/// ([`lock_system_clipboard`]) before it gives up on a copy or a paste.
+const SYSTEM_CLIPBOARD_WAIT: core::time::Duration = core::time::Duration::from_millis(500);
+
+// A wait with a time limit needs a condition variable, which `epaint::mutex` doesn't have.
+#[expect(
+    clippy::disallowed_types,
+    reason = "a timed wait (Condvar) goes with std's Mutex"
+)]
+static SYSTEM_CLIPBOARD_BUSY: std::sync::Mutex<bool> = std::sync::Mutex::new(false);
+#[expect(
+    clippy::disallowed_types,
+    reason = "a timed wait (Condvar) goes with std's Mutex"
+)]
+static SYSTEM_CLIPBOARD_FREED: std::sync::Condvar = std::sync::Condvar::new();
+
+/// The system clipboard held by this process for one read or write: see
+/// [`lock_system_clipboard`]. Released when dropped.
+#[must_use = "the clipboard is released when this is dropped"]
+pub struct SystemClipboardLock {
+    _private: (),
+}
+
+impl Drop for SystemClipboardLock {
+    fn drop(&mut self) {
+        *SYSTEM_CLIPBOARD_BUSY
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = false;
+        SYSTEM_CLIPBOARD_FREED.notify_one();
+    }
+}
+
+/// Waits (at most `wait`) until no other thread of this process uses the system clipboard,
+/// then holds it until the returned lock is dropped; `None` when the wait ran out.
+///
+/// Windows lets every thread of a process open the clipboard at the same time when they open it
+/// without a window, as arboard does, and two reads at once then free each other's data: the
+/// heap is corrupted and the process ends. egui takes this lock around each of its own arboard
+/// calls; an application that reads or writes the clipboard itself (another arboard, or on a
+/// thread of its own) takes it too, so that there is one use at a time in the whole process.
+pub fn lock_system_clipboard(wait: core::time::Duration) -> Option<SystemClipboardLock> {
+    let deadline = std::time::Instant::now() + wait;
+    let mut busy = SYSTEM_CLIPBOARD_BUSY
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    while *busy {
+        let left = deadline.checked_duration_since(std::time::Instant::now())?;
+        if left.is_zero() {
+            return None;
+        }
+        busy = SYSTEM_CLIPBOARD_FREED
+            .wait_timeout(busy, left)
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .0;
+    }
+    *busy = true;
+    Some(SystemClipboardLock { _private: () })
+}
+
+/// [`lock_system_clipboard`] for one of egui's own copies or pastes, logged when it waited in
+/// vain (another use of the clipboard in this process never ended).
+#[cfg(all(
+    not(any(target_os = "android", target_os = "ios")),
+    feature = "arboard",
+))]
+fn lock_for_arboard() -> Option<SystemClipboardLock> {
+    let lock = lock_system_clipboard(SYSTEM_CLIPBOARD_WAIT);
+    if lock.is_none() {
+        log::warn!("the clipboard is in use elsewhere in this process; copy or paste skipped");
+    }
+    lock
+}
+
 /// Handles interfacing with the OS clipboard.
 ///
 /// If the "clipboard" feature is off, or we cannot connect to the OS clipboard,
@@ -298,6 +371,7 @@ impl Clipboard {
             feature = "arboard",
         ))]
         if let Some(clipboard) = &mut self.arboard {
+            let _lock = lock_for_arboard()?;
             return match clipboard.get_text() {
                 Ok(text) => Some(text),
                 Err(err) => {
@@ -363,6 +437,9 @@ impl Clipboard {
             feature = "arboard",
         ))]
         if let Some(clipboard) = &mut self.arboard {
+            let Some(_lock) = lock_for_arboard() else {
+                return;
+            };
             if let Err(err) = clipboard.set_text(text) {
                 log::error!("arboard copy/cut error: {err}");
             }
@@ -411,6 +488,7 @@ impl Clipboard {
             feature = "arboard",
         ))]
         if let Some(clipboard) = &mut self.arboard {
+            let _lock = lock_for_arboard()?;
             return match clipboard.get_image() {
                 Ok(image) => Some(color_image_from_arboard(&image)),
                 Err(err) => {
@@ -457,6 +535,9 @@ impl Clipboard {
             feature = "arboard",
         ))]
         if let Some(clipboard) = &mut self.arboard {
+            let Some(_lock) = lock_for_arboard() else {
+                return;
+            };
             if let Err(err) = clipboard.set_image(arboard_from_color_image(image)) {
                 log::error!("arboard copy/cut error: {err}");
             }
@@ -523,6 +604,7 @@ cfg_select! {
                 #[cfg(feature = "arboard")]
                 if let Some(clipboard) = &mut self.arboard {
                     use arboard::GetExtLinux as _;
+                    let _lock = lock_for_arboard()?;
                     return clipboard
                         .get()
                         .clipboard(arboard::LinuxClipboardKind::Primary)
@@ -562,6 +644,9 @@ cfg_select! {
                 #[cfg(feature = "arboard")]
                 if let Some(clipboard) = &mut self.arboard {
                     use arboard::SetExtLinux as _;
+                    let Some(_lock) = lock_for_arboard() else {
+                        return;
+                    };
                     if let Err(err) = clipboard
                         .set()
                         .clipboard(arboard::LinuxClipboardKind::Primary)
@@ -1118,6 +1203,51 @@ mod tests {
         assert_eq!(
             &*image.bytes,
             &[255, 0, 0, 255, 255, 255, 255, 128, 0, 0, 0, 0]
+        );
+    }
+
+    /// One use of the system clipboard at a time in the process, whichever thread asks; a wait
+    /// that runs out gives up instead of blocking.
+    #[test]
+    fn system_clipboard_lock_is_one_at_a_time() {
+        use core::sync::atomic::{AtomicUsize, Ordering};
+        use core::time::Duration;
+        use std::sync::Arc;
+        let inside = Arc::new(AtomicUsize::new(0));
+        let most = Arc::new(AtomicUsize::new(0));
+        let threads: Vec<_> = (0..8)
+            .map(|i| {
+                let (inside, most) = (Arc::clone(&inside), Arc::clone(&most));
+                std::thread::Builder::new()
+                    .name(format!("clipboard user {i}"))
+                    .spawn(move || {
+                        for _ in 0..25 {
+                            let _lock = super::lock_system_clipboard(Duration::from_secs(30))
+                                .expect("the lock is released");
+                            let now = inside.fetch_add(1, Ordering::SeqCst) + 1;
+                            most.fetch_max(now, Ordering::SeqCst);
+                            std::thread::sleep(Duration::from_millis(1));
+                            inside.fetch_sub(1, Ordering::SeqCst);
+                        }
+                    })
+                    .expect("a thread")
+            })
+            .collect();
+        for t in threads {
+            t.join().expect("no panic");
+        }
+        assert_eq!(most.load(Ordering::SeqCst), 1);
+
+        let held = super::lock_system_clipboard(Duration::ZERO).expect("free");
+        let other = std::thread::Builder::new()
+            .name("clipboard waiter".to_owned())
+            .spawn(|| super::lock_system_clipboard(Duration::from_millis(50)).is_some())
+            .expect("a thread");
+        assert!(!other.join().expect("no panic"), "gave up while held");
+        drop(held);
+        assert!(
+            super::lock_system_clipboard(Duration::ZERO).is_some(),
+            "free again"
         );
     }
 }

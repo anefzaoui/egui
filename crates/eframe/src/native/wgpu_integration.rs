@@ -1299,6 +1299,10 @@ fn render_immediate_viewport(
             });
         }
 
+        // Apply the builder's changes (e.g. a new `inner_size`) before this pass rather than
+        // after it is painted, so the pass is laid out and drawn at the size the window has.
+        viewport.process_commands(egui_ctx, vec![]);
+
         let (Some(window), Some(egui_winit)) = (&viewport.window, &mut viewport.egui_winit) else {
             return;
         };

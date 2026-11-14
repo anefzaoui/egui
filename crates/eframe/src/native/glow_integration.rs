@@ -160,6 +160,9 @@ struct Viewport {
 
     /// The window was created hidden and is shown once the viewport has painted.
     show_after_first_paint: bool,
+    /// Whether `gl_surface`'s swaps wait for the screen's refresh, as last set on it (see
+    /// [`set_swap_interval`]).
+    swap_waits: bool,
 }
 
 impl Viewport {
@@ -854,6 +857,7 @@ impl GlowWinitRunning<'_> {
             not_current_gl_context,
             current_viewport,
             pending_delta,
+            swap_interval,
             ..
         } = &mut *glutin;
 
@@ -966,6 +970,14 @@ impl GlowWinitRunning<'_> {
                 // swap with interval 0 on Wayland (see `GlutinWindowContext::new`).
                 // egui-wgpu does the same. A no-op on other platforms.
                 window.pre_present_notify();
+                set_swap_interval(
+                    viewport_id,
+                    &viewport.info,
+                    &mut viewport.swap_waits,
+                    waits(*swap_interval),
+                    gl_surface,
+                    context,
+                );
                 gl_surface.swap_buffers(context)?;
                 frame_timer.resume();
             }
@@ -1138,6 +1150,41 @@ impl GlowWinitRunning<'_> {
             EventResult::Wait
         }
     }
+}
+
+/// Whether swaps with this interval wait for the screen's refresh.
+fn waits(interval: glutin::surface::SwapInterval) -> bool {
+    matches!(interval, glutin::surface::SwapInterval::Wait(_))
+}
+
+/// Before a window's swap: its swap interval as the app's hooks want it now
+/// ([`super::ViewportHooks::swap_waits_for_vsync`]), set on its surface when the answer changes.
+/// `swap_waits`: what the surface has; `vsync`: what eframe gave every window. The context is
+/// current on `gl_surface`.
+fn set_swap_interval(
+    viewport_id: ViewportId,
+    info: &ViewportInfo,
+    swap_waits: &mut bool,
+    vsync: bool,
+    gl_surface: &glutin::surface::Surface<glutin::surface::WindowSurface>,
+    context: &glutin::context::PossiblyCurrentContext,
+) {
+    let wants = super::viewport_hooks::ask(vsync, |hooks| {
+        hooks.swap_waits_for_vsync(viewport_id, info, vsync)
+    });
+    if wants == *swap_waits {
+        return;
+    }
+    let interval = if wants {
+        glutin::surface::SwapInterval::Wait(NonZeroU32::MIN)
+    } else {
+        glutin::surface::SwapInterval::DontWait
+    };
+    if let Err(err) = gl_surface.set_swap_interval(context, interval) {
+        log::warn!("Failed to set the swap interval of {viewport_id:?}: {err}");
+    }
+    // Not asked of the driver again after a failure: it would fail the same way every frame.
+    *swap_waits = wants;
 }
 
 fn change_gl_context(
@@ -1360,6 +1407,7 @@ impl GlutinWindowContext {
                 window: window.map(Arc::new),
                 egui_winit: None,
                 show_after_first_paint: false,
+                swap_waits: false,
             },
         );
 
@@ -1516,6 +1564,7 @@ impl GlutinWindowContext {
             {
                 log::warn!("Failed to set swap interval due to error: {err}");
             }
+            viewport.swap_waits = waits(self.swap_interval);
 
             // we will reach this point only once in most platforms except android.
             // create window/surface/make context current once and just use them forever.
@@ -1739,6 +1788,7 @@ fn initialize_or_update_viewport<'a>(
                 egui_winit: None,
                 gl_surface: None,
                 show_after_first_paint: false,
+                swap_waits: false,
             })
         }
 
@@ -1887,6 +1937,7 @@ fn render_immediate_viewport(
         current_viewport,
         viewports,
         pending_delta,
+        swap_interval,
         ..
     } = &mut *glutin;
 
@@ -1943,6 +1994,14 @@ fn render_immediate_viewport(
 
     {
         profiling::scope!("swap_buffers");
+        set_swap_interval(
+            viewport_id,
+            &viewport.info,
+            &mut viewport.swap_waits,
+            waits(*swap_interval),
+            gl_surface,
+            current_gl_context,
+        );
         if let Err(err) = gl_surface.swap_buffers(current_gl_context) {
             log::error!("swap_buffers failed: {err}");
         }

@@ -24,6 +24,24 @@ pub trait ViewportHooks: Send + Sync {
     /// The raw input of one viewport (`raw_input.viewport_id`), before egui processes it. Runs for
     /// root, deferred and immediate viewports, before [`crate::App::raw_input_hook`].
     fn raw_input(&self, _ctx: &egui::Context, _raw_input: &mut egui::RawInput) {}
+
+    /// OpenGL (glow): whether the next buffer swap of `viewport` waits for the screen's refresh,
+    /// asked before each of its swaps. `info` is the window's state now; `vsync` is the interval
+    /// eframe gave every window ([`crate::NativeOptions::vsync`], never on Wayland, where winit
+    /// paces the frames). eframe sets the window's swap interval when the answer changes.
+    ///
+    /// Every viewport of an app draws in one pass of the event loop (immediate ones in their
+    /// parent's), so with vsync on each window's swap can wait a refresh of its own, and a swap
+    /// to a window the compositor isn't showing can wait much longer; an app can let one window
+    /// wait and the others swap at once.
+    fn swap_waits_for_vsync(
+        &self,
+        _viewport: egui::ViewportId,
+        _info: &egui::ViewportInfo,
+        vsync: bool,
+    ) -> bool {
+        vsync
+    }
 }
 
 static HOOKS: RwLock<Option<Arc<dyn ViewportHooks>>> = RwLock::new(None);
@@ -36,6 +54,16 @@ pub(crate) fn with(f: impl FnOnce(&dyn ViewportHooks)) {
     let hooks = HOOKS.read().clone();
     if let Some(hooks) = hooks {
         f(&*hooks);
+    }
+}
+
+/// The installed hooks' answer, or `default` without hooks.
+#[cfg(feature = "glow")]
+pub(crate) fn ask<R>(default: R, f: impl FnOnce(&dyn ViewportHooks) -> R) -> R {
+    let hooks = HOOKS.read().clone();
+    match hooks {
+        Some(hooks) => f(&*hooks),
+        None => default,
     }
 }
 

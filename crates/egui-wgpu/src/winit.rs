@@ -658,6 +658,20 @@ impl Painter {
             return vsync_sec;
         }
 
+        // The window can change size between its `Resized` event and this paint (e.g. a
+        // resize requested by the app this frame). Match the surface to the window now, so
+        // the frame is drawn at the window's size instead of being stretched to it.
+        let inner_size = window.inner_size();
+        if let (Some(width), Some(height)) = (
+            NonZeroU32::new(inner_size.width),
+            NonZeroU32::new(inner_size.height),
+        ) && self.render_state.is_some()
+            && self.surfaces.get(&viewport_id).is_some_and(|s| {
+            (s.window_width, s.window_height) != (width.get(), height.get())
+        }) {
+            self.resize_and_generate_depth_texture_view_and_msaa_view(viewport_id, width, height);
+        }
+
         let Some(render_state) = self.render_state.as_mut() else {
             return vsync_sec;
         };

@@ -1204,11 +1204,17 @@ fn change_gl_context(
     // (or after the surface the context was current on has been dropped), it gives the wrong
     // answer: https://github.com/emilk/egui/issues/4289
     // So we keep track of which viewport the context is current on ourselves.
+    //
+    // And the context itself must still be this thread's current one: on macOS
+    // `gl_surface.is_current` only compares the view the context is attached to, and something
+    // else on the main thread (AppKit) can clear or change the thread's current context while
+    // that view stays attached. Trusting the view alone, OpenGL calls would then go to no
+    // context at all: `glGenTextures` gives 0 and egui_glow can't create a texture.
     if *current_viewport == Some(viewport_id)
         && let Some(current_gl_context) = current_gl_context
     {
         profiling::scope!("is_current");
-        if gl_surface.is_current(current_gl_context) {
+        if current_gl_context.is_current() && gl_surface.is_current(current_gl_context) {
             return;
         }
     }

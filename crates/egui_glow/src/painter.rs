@@ -101,6 +101,9 @@ pub struct Painter {
     /// Stores outdated OpenGL textures that are yet to be deleted
     textures_to_destroy: Vec<glow::Texture>,
 
+    /// OpenGL couldn't create the last texture asked for (logged once until it can again).
+    texture_creation_failed: bool,
+
     /// Used to make sure we are destroyed correctly.
     destroyed: bool,
 }
@@ -267,6 +270,7 @@ impl Painter {
                 textures: Default::default(),
                 next_native_tex_id: 1 << 32,
                 textures_to_destroy: Vec::new(),
+                texture_creation_failed: false,
                 destroyed: false,
             })
         }
@@ -353,6 +357,9 @@ impl Painter {
     }
 
     /// You are expected to have cleared the color buffer before calling this.
+    ///
+    /// A texture OpenGL can't create now (see [`Self::try_set_texture`]) stays in
+    /// `textures_delta.set`, with the later changes to it, so a later call creates it.
     pub fn paint_and_update_textures(
         &mut self,
         screen_size_px: [u32; 2],
@@ -362,17 +369,26 @@ impl Painter {
     ) {
         profiling::function_scope!();
 
+        let mut not_created = Vec::new();
         #[expect(clippy::iter_over_hash_type)] // Order doesn't matter here
         for (id, image_deltas) in textures_delta.set.drain() {
-            for image_delta in image_deltas {
-                self.set_texture(id, &image_delta);
+            let mut image_deltas = image_deltas.into_iter();
+            while let Some(image_delta) = image_deltas.next() {
+                if self.try_set_texture(id, &image_delta).is_err() {
+                    // This change and the ones after it wait for a later frame, in order.
+                    let kept = core::iter::once(image_delta).chain(image_deltas).collect();
+                    not_created.push((id, kept));
+                    break;
+                }
             }
         }
+        textures_delta.set.extend(not_created);
 
         self.paint_primitives(screen_size_px, pixels_per_point, clipped_primitives);
 
         #[expect(clippy::iter_over_hash_type)] // Order doesn't matter here
         for id in textures_delta.free.drain() {
+            textures_delta.set.remove(&id);
             self.free_texture(id);
         }
     }
@@ -507,15 +523,54 @@ impl Painter {
 
     // ------------------------------------------------------------------------
 
+    /// Applies a change to a texture, creating it if it's new.
+    ///
+    /// If OpenGL can't create the texture, the change is dropped (with a warning), see
+    /// [`Self::try_set_texture`].
     pub fn set_texture(&mut self, tex_id: egui::TextureId, delta: &egui::epaint::ImageDelta) {
+        // Already logged by `try_set_texture`.
+        let _ = self.try_set_texture(tex_id, delta);
+    }
+
+    /// Applies a change to a texture, creating it if it's new.
+    ///
+    /// # Errors
+    /// When OpenGL can't create a new texture: `glGenTextures` gives 0, which happens when no
+    /// OpenGL context is current on this thread (or it was lost). Nothing is changed then, and
+    /// the same change can be given again later. A warning is logged the first time, until a
+    /// texture can be created again.
+    pub fn try_set_texture(
+        &mut self,
+        tex_id: egui::TextureId,
+        delta: &egui::epaint::ImageDelta,
+    ) -> Result<(), PainterError> {
         profiling::function_scope!();
 
         self.assert_not_destroyed();
 
-        let glow_texture = *self
-            .textures
-            .entry(tex_id)
-            .or_insert_with(|| unsafe { self.gl.create_texture().unwrap() });
+        let glow_texture = if let Some(texture) = self.textures.get(&tex_id) {
+            *texture
+        } else {
+            match unsafe { self.gl.create_texture() } {
+                Ok(texture) => {
+                    if self.texture_creation_failed {
+                        self.texture_creation_failed = false;
+                        log::info!("OpenGL creates textures again");
+                    }
+                    self.textures.insert(tex_id, texture);
+                    texture
+                }
+                Err(err) => {
+                    if !self.texture_creation_failed {
+                        self.texture_creation_failed = true;
+                        log::warn!(
+                            "OpenGL could not create texture {tex_id:?}: {err} (is no OpenGL context current?)"
+                        );
+                    }
+                    return Err(PainterError(err));
+                }
+            }
+        };
         unsafe {
             self.gl.bind_texture(glow::TEXTURE_2D, Some(glow_texture));
         }
@@ -533,6 +588,7 @@ impl Painter {
                 self.upload_texture_srgb(delta.pos, image.size, delta.options, data);
             }
         }
+        Ok(())
     }
 
     fn upload_texture_srgb(

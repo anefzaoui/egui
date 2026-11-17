@@ -663,20 +663,31 @@ impl GlowWinitRunning<'_> {
         let mut frame_timer = crate::stopwatch::Stopwatch::new();
         frame_timer.start();
 
-        {
+        let parent_window = {
             let glutin = self.glutin.borrow();
             let viewport = &glutin.viewports[&viewport_id];
             let is_immediate = viewport.viewport_ui_cb.is_none();
             if is_immediate && viewport_id != ViewportId::ROOT {
                 // This will only happen if this is an immediate viewport.
                 // That means that the viewport cannot be rendered by itself and needs his parent to be rendered.
-                if let Some(parent_viewport) = glutin.viewports.get(&viewport.ids.parent)
-                    && let Some(window) = parent_viewport.window.as_ref()
+                match glutin
+                    .viewports
+                    .get(&viewport.ids.parent)
+                    .and_then(|parent| parent.window.as_ref())
                 {
-                    return Ok(EventResult::RepaintNext(window.id()));
+                    Some(window) => Some(window.id()),
+                    None => return Ok(EventResult::Wait),
                 }
-                return Ok(EventResult::Wait);
+            } else {
+                None
             }
+        };
+        if let Some(parent_window) = parent_window {
+            // The parent's pass runs now, at this window's own redraw, rather than at the
+            // parent's next one: a Wayland compositor sends no frame callbacks to a window it
+            // isn't showing (another workspace), so a parent out of sight never redraws, and its
+            // immediate viewports, shown, answered nothing.
+            return self.run_ui_and_paint(event_loop, parent_window, mode);
         }
 
         let (raw_input, viewport_ui_cb, is_visible, show_ui) = {
@@ -706,10 +717,12 @@ impl GlowWinitRunning<'_> {
 
             // The app asked for its UI while the window isn't visible (it opens a window).
             let asked = egui_ctx.take_ui_pass_request(viewport_id);
-            let show_ui = mode == PassMode::Full
-                && (is_visible
-                    || asked
-                    || is_viewport_or_descendant_visible(&glutin.viewports, viewport_id));
+            // Asked for, the UI runs where the logic alone would have: in the pass of a window
+            // whose redraw the system withholds (a Wayland window out of sight), which opens one.
+            let show_ui = asked
+                || mode == PassMode::Full
+                    && (is_visible
+                        || is_viewport_or_descendant_visible(&glutin.viewports, viewport_id));
 
             self.integration.pre_update();
 

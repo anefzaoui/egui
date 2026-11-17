@@ -641,6 +641,31 @@ impl WgpuWinitRunning<'_> {
             return Ok(EventResult::Wait);
         };
 
+        // An immediate viewport is drawn by its parent's pass: that runs now, at this window's own
+        // redraw, rather than at the parent's next one, which a Wayland compositor withholds from a
+        // window it isn't showing (another workspace).
+        let parent_window = {
+            let shared = self.shared.borrow();
+            match shared.viewports.get(&viewport_id) {
+                Some(viewport)
+                    if viewport_id != ViewportId::ROOT && viewport.viewport_ui_cb.is_none() =>
+                {
+                    match shared
+                        .viewports
+                        .get(&viewport.ids.parent)
+                        .and_then(|parent| parent.window.as_ref())
+                    {
+                        Some(window) => Some(window.id()),
+                        None => return Ok(EventResult::Wait),
+                    }
+                }
+                _ => None,
+            }
+        };
+        if let Some(parent_window) = parent_window {
+            return self.run_ui_and_paint(parent_window, event_loop, mode);
+        }
+
         profiling::finish_frame!();
 
         let Self {
@@ -717,10 +742,10 @@ impl WgpuWinitRunning<'_> {
 
             // The app asked for its UI while the window isn't visible (it opens a window).
             let asked = integration.egui_ctx.take_ui_pass_request(viewport_id);
-            let show_ui = mode == PassMode::Full
-                && (is_visible
-                    || asked
-                    || is_viewport_or_descendant_visible(viewports, viewport_id));
+            // Asked for, the UI runs where the logic alone would have (see glow_integration).
+            let show_ui = asked
+                || mode == PassMode::Full
+                    && (is_visible || is_viewport_or_descendant_visible(viewports, viewport_id));
 
             integration.pre_update();
 

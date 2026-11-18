@@ -42,6 +42,27 @@ pub trait ViewportHooks: Send + Sync {
     ) -> bool {
         vsync
     }
+
+    /// OpenGL (glow): `viewport` wasn't painted this time. eframe couldn't make its OpenGL
+    /// context current on the window, the window has no OpenGL surface (one couldn't be made for
+    /// it), or the frame couldn't be shown (its buffer swap failed). eframe logs it, keeps the
+    /// context, and paints the viewport again shortly (an immediate one through its parent).
+    ///
+    /// `error` says which, with the driver's error; `in_a_row` is how many of this viewport's
+    /// paints in a row failed, this one included, and `failing_for` the time since the first of
+    /// them. Some drivers fail now and then and the next paint works: Intel's on Windows fail
+    /// `wglMakeCurrent` while a window is destroyed or hidden, on a desktop switch, or under
+    /// memory pressure. A viewport that keeps failing may have lost its graphics device (a driver
+    /// reset or update), which OpenGL doesn't come back from by itself: the app can start again,
+    /// or draw another way.
+    fn gl_paint_failed(
+        &self,
+        _viewport: egui::ViewportId,
+        _error: &str,
+        _in_a_row: u32,
+        _failing_for: core::time::Duration,
+    ) {
+    }
 }
 
 static HOOKS: RwLock<Option<Arc<dyn ViewportHooks>>> = RwLock::new(None);

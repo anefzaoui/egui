@@ -14,7 +14,6 @@ use std::{rc::Rc, sync::Arc, time::Instant};
 use egui_winit::ActionRequested;
 use glutin::{
     config::GlConfig as _,
-    context::NotCurrentGlContext as _,
     display::GetGlDisplay as _,
     prelude::{GlDisplay as _, PossiblyCurrentGlContext as _},
     surface::GlSurface as _,
@@ -103,8 +102,14 @@ struct GlutinWindowContext {
     /// Passed on to each [`egui_winit::State`]. See [`NativeOptions::clipboard_shortcuts`].
     clipboard_shortcuts: bool,
 
-    current_gl_context: Option<glutin::context::PossiblyCurrentContext>,
-    not_current_gl_context: Option<glutin::context::NotCurrentContext>,
+    /// The one OpenGL context every viewport draws with: current on one viewport's surface at a
+    /// time ([`Self::current_viewport`]), or none.
+    ///
+    /// Kept as a `PossiblyCurrentContext` from its creation, and switched between surfaces with
+    /// the `make_current` that borrows it: glutin's `NotCurrentContext::make_current` and
+    /// `PossiblyCurrentContext::make_not_current` consume the context and, when the driver
+    /// fails, drop it, which deletes it (`wglDeleteContext`) with every texture and buffer in it.
+    gl_context: glutin::context::PossiblyCurrentContext,
 
     /// The viewport whose `gl_surface` the context was last made current with.
     ///
@@ -163,6 +168,13 @@ struct Viewport {
     /// Whether `gl_surface`'s swaps wait for the screen's refresh, as last set on it (see
     /// [`set_swap_interval`]).
     swap_waits: bool,
+
+    /// Its paints in a row that failed (see [`paint_failed`]).
+    paint_failures: PaintFailures,
+
+    /// Its window was resized while the context couldn't be made current on it: `gl_surface`
+    /// is resized at its next paint.
+    resize_pending: bool,
 }
 
 impl Viewport {
@@ -531,7 +543,7 @@ impl WinitApp for GlowWinitApp<'_> {
         mode: PassMode,
     ) -> Result<EventResult> {
         if let Some(running) = &mut self.running {
-            running.run_ui_and_paint(event_loop, window_id, mode)
+            Ok(running.run_ui_and_paint(event_loop, window_id, mode))
         } else {
             Ok(EventResult::Wait)
         }
@@ -557,7 +569,7 @@ impl WinitApp for GlowWinitApp<'_> {
 
     fn suspended(&mut self, _: &ActiveEventLoop) -> crate::Result<EventResult> {
         if let Some(running) = &mut self.running {
-            running.glutin.borrow_mut().on_suspend()?;
+            running.glutin.borrow_mut().on_suspend();
         }
         Ok(EventResult::Save)
     }
@@ -641,7 +653,7 @@ impl GlowWinitRunning<'_> {
         event_loop: &ActiveEventLoop,
         window_id: WindowId,
         mode: PassMode,
-    ) -> Result<EventResult> {
+    ) -> EventResult {
         profiling::function_scope!();
 
         let Some(viewport_id) = self
@@ -651,7 +663,7 @@ impl GlowWinitRunning<'_> {
             .get(&window_id)
             .copied()
         else {
-            return Ok(EventResult::Wait);
+            return EventResult::Wait;
         };
 
         profiling::finish_frame!();
@@ -669,9 +681,9 @@ impl GlowWinitRunning<'_> {
                 if let Some(parent_viewport) = glutin.viewports.get(&viewport.ids.parent)
                     && let Some(window) = parent_viewport.window.as_ref()
                 {
-                    return Ok(EventResult::RepaintNext(window.id()));
+                    return EventResult::RepaintNext(window.id());
                 }
-                return Ok(EventResult::Wait);
+                return EventResult::Wait;
             }
         }
 
@@ -679,10 +691,10 @@ impl GlowWinitRunning<'_> {
             let mut glutin = self.glutin.borrow_mut();
             let egui_ctx = glutin.egui_ctx.clone();
             let Some(viewport) = glutin.viewports.get_mut(&viewport_id) else {
-                return Ok(EventResult::Wait);
+                return EventResult::Wait;
             };
             let Some(window) = viewport.window.as_ref() else {
-                return Ok(EventResult::Wait);
+                return EventResult::Wait;
             };
             egui_winit::update_viewport_info(&mut viewport.info, &egui_ctx, window, false);
 
@@ -695,7 +707,7 @@ impl GlowWinitRunning<'_> {
                     .any(egui_winit::ActionRequested::wants_paint);
 
             let Some(egui_winit) = viewport.egui_winit.as_mut() else {
-                return Ok(EventResult::Wait);
+                return EventResult::Wait;
             };
             let mut raw_input = egui_winit.take_egui_input(window);
             let viewport_ui_cb = viewport.viewport_ui_cb.clone();
@@ -761,11 +773,11 @@ impl GlowWinitRunning<'_> {
                     .and_then(|viewport| viewport.window.as_deref()),
             );
 
-            return Ok(if self.integration.should_close() {
+            return if self.integration.should_close() {
                 EventResult::CloseRequested
             } else {
                 EventResult::Wait
-            });
+            };
         }
 
         // HACK: In order to get the right clear_color, the system theme needs to be set, which
@@ -781,42 +793,45 @@ impl GlowWinitRunning<'_> {
         let has_many_viewports = self.glutin.borrow().viewports.len() > 1;
         let clear_before_update = !has_many_viewports; // HACK: for some reason, an early clear doesn't "take" on Mac with multiple viewports.
 
+        // Whether the window's surface was cleared before the update (else it is before painting).
+        let mut cleared = false;
+
         if is_visible && clear_before_update {
             // clear before we call update, so users can paint between clear-color and egui windows:
 
             let mut glutin = self.glutin.borrow_mut();
             let GlutinWindowContext {
                 viewports,
-                current_gl_context,
-                not_current_gl_context,
+                gl_context,
                 current_viewport,
                 ..
             } = &mut *glutin;
             let viewport = &viewports[&viewport_id];
             let Some(window) = viewport.window.as_ref() else {
-                return Ok(EventResult::Wait);
+                return EventResult::Wait;
             };
             let Some(gl_surface) = viewport.gl_surface.as_ref() else {
-                return Ok(EventResult::Wait);
+                return EventResult::Wait;
             };
 
             let screen_size_in_pixels: [u32; 2] = window.inner_size().into();
 
-            {
-                frame_timer.pause();
-                change_gl_context(
-                    current_gl_context,
-                    not_current_gl_context,
-                    current_viewport,
-                    viewport_id,
-                    gl_surface,
-                );
-                frame_timer.resume();
-            }
+            frame_timer.pause();
+            let switched = change_gl_context(gl_context, current_viewport, viewport_id, gl_surface);
+            frame_timer.resume();
 
-            self.painter
-                .borrow()
-                .clear(screen_size_in_pixels, clear_color);
+            // A failure is the paint's to count: it switches again, and clears then.
+            match switched {
+                Ok(()) => {
+                    self.painter
+                        .borrow()
+                        .clear(screen_size_in_pixels, clear_color);
+                    cleared = true;
+                }
+                Err(err) => {
+                    log::debug!("Not cleared before the update of {viewport_id:?}: {err}");
+                }
+            }
         }
 
         // ------------------------------------------------------------
@@ -853,8 +868,7 @@ impl GlowWinitRunning<'_> {
 
         let GlutinWindowContext {
             viewports,
-            current_gl_context,
-            not_current_gl_context,
+            gl_context,
             current_viewport,
             pending_delta,
             swap_interval,
@@ -862,13 +876,15 @@ impl GlowWinitRunning<'_> {
         } = &mut *glutin;
 
         let Some(viewport) = viewports.get_mut(&viewport_id) else {
-            return Ok(EventResult::Wait);
+            return EventResult::Wait;
         };
 
         viewport.info.events.clear(); // they should have been processed
-        let window = viewport.window.clone().unwrap();
-        let gl_surface = viewport.gl_surface.as_ref().unwrap();
-        let egui_winit = viewport.egui_winit.as_mut().unwrap();
+        let (Some(window), Some(egui_winit)) =
+            (viewport.window.clone(), viewport.egui_winit.as_mut())
+        else {
+            return EventResult::Wait;
+        };
 
         // eframe handles platform output before the generic viewport-command loop. Pull this
         // viewport's IME permission commands forward so `IMEAllowed(false)` takes effect before
@@ -892,102 +908,125 @@ impl GlowWinitRunning<'_> {
         if is_visible {
             let clipped_primitives = integration.egui_ctx.tessellate(shapes, pixels_per_point);
 
-            {
-                // We may need to switch contexts again, because of immediate viewports:
-                frame_timer.pause();
-                change_gl_context(
-                    current_gl_context,
-                    not_current_gl_context,
-                    current_viewport,
-                    viewport_id,
-                    gl_surface,
-                );
-                frame_timer.resume();
-            }
-
-            let screen_size_in_pixels: [u32; 2] = window.inner_size().into();
-
-            if !clear_before_update {
-                painter.clear(screen_size_in_pixels, clear_color);
-            }
-
-            painter.paint_and_update_textures(
-                screen_size_in_pixels,
-                pixels_per_point,
-                &clipped_primitives,
-                pending_delta,
+            // We may need to switch contexts again, because of immediate viewports:
+            frame_timer.pause();
+            let switched = switch_to_paint(
+                gl_context,
+                current_viewport,
+                viewport_id,
+                viewport.gl_surface.as_ref(),
             );
+            frame_timer.resume();
 
-            {
-                let mut screenshot_callbacks = Vec::new();
-                for action in viewport.actions_requested.drain(..) {
-                    match action {
-                        ActionRequested::Screenshot(callback) => {
-                            screenshot_callbacks.push(callback);
+            match switched {
+                Err(error) => {
+                    // Not painted: the texture changes wait in `pending_delta`, the requested
+                    // actions in `actions_requested`, for the next paint.
+                    paint_failed(
+                        &integration.egui_ctx,
+                        viewport_id,
+                        viewport_id,
+                        &mut viewport.paint_failures,
+                        &error,
+                    );
+                }
+                Ok(gl_surface) => {
+                    if core::mem::take(&mut viewport.resize_pending) {
+                        resize_surface(gl_context, gl_surface, window.inner_size());
+                    }
+
+                    let screen_size_in_pixels: [u32; 2] = window.inner_size().into();
+
+                    if !cleared {
+                        painter.clear(screen_size_in_pixels, clear_color);
+                    }
+
+                    painter.paint_and_update_textures(
+                        screen_size_in_pixels,
+                        pixels_per_point,
+                        &clipped_primitives,
+                        pending_delta,
+                    );
+
+                    {
+                        let mut screenshot_callbacks = Vec::new();
+                        for action in viewport.actions_requested.drain(..) {
+                            match action {
+                                ActionRequested::Screenshot(callback) => {
+                                    screenshot_callbacks.push(callback);
+                                }
+                                ActionRequested::PaintWhileHidden => {
+                                    // Painting this frame is all it asked for.
+                                }
+                                ActionRequested::Cut => {
+                                    egui_winit.request_cut(&window);
+                                }
+                                ActionRequested::Copy => {
+                                    egui_winit.request_copy(&window);
+                                }
+                                ActionRequested::Paste => {
+                                    // On Wayland this starts the bounded asynchronous paste bridge
+                                    // instead of a blocking `clipboard_text()`/image read.
+                                    egui_winit.request_paste(&window);
+                                }
+                            }
                         }
-                        ActionRequested::PaintWhileHidden => {
-                            // Painting this frame is all it asked for.
+
+                        if !screenshot_callbacks.is_empty() {
+                            let screenshot =
+                                Arc::new(painter.read_screen_rgba(screen_size_in_pixels));
+                            for callback in screenshot_callbacks {
+                                callback.complete(Arc::clone(&screenshot));
+                            }
                         }
-                        ActionRequested::Cut => {
-                            egui_winit.request_cut(&window);
-                        }
-                        ActionRequested::Copy => {
-                            egui_winit.request_copy(&window);
-                        }
-                        ActionRequested::Paste => {
-                            // On Wayland this starts the bounded asynchronous paste bridge
-                            // instead of a blocking `clipboard_text()`/image read.
-                            egui_winit.request_paste(&window);
+
+                        integration.post_rendering(&window);
+                        if core::mem::take(&mut viewport.show_after_first_paint) {
+                            window.set_visible(true);
                         }
                     }
-                }
 
-                if !screenshot_callbacks.is_empty() {
-                    let screenshot = Arc::new(painter.read_screen_rgba(screen_size_in_pixels));
-                    for callback in screenshot_callbacks {
-                        callback.complete(Arc::clone(&screenshot));
+                    {
+                        // vsync - don't count as frame-time:
+                        frame_timer.pause();
+                        profiling::scope!("swap_buffers");
+
+                        // On Wayland this makes winit hold back the next `RedrawRequested` until
+                        // the compositor sends a frame callback. That is our frame pacing there,
+                        // since we swap with interval 0 on Wayland (see
+                        // `GlutinWindowContext::new`). egui-wgpu does the same. A no-op on other
+                        // platforms.
+                        window.pre_present_notify();
+                        set_swap_interval(
+                            viewport_id,
+                            &viewport.info,
+                            &mut viewport.swap_waits,
+                            waits(*swap_interval),
+                            gl_surface,
+                            gl_context,
+                        );
+                        // A swap that fails is a paint that failed, not the app's end.
+                        match gl_surface.swap_buffers(gl_context) {
+                            Ok(()) => painted(viewport_id, &mut viewport.paint_failures),
+                            Err(err) => paint_failed(
+                                &integration.egui_ctx,
+                                viewport_id,
+                                viewport_id,
+                                &mut viewport.paint_failures,
+                                &format!("swap_buffers failed: {err}"),
+                            ),
+                        }
+                        frame_timer.resume();
+                    }
+
+                    // give it time to settle:
+                    #[cfg(feature = "__screenshot")]
+                    if integration.egui_ctx.cumulative_pass_nr() == 2
+                        && let Ok(path) = std::env::var("EFRAME_SCREENSHOT_TO")
+                    {
+                        save_screenshot_and_exit(&path, &painter, screen_size_in_pixels);
                     }
                 }
-
-                integration.post_rendering(&window);
-                if core::mem::take(&mut viewport.show_after_first_paint) {
-                    window.set_visible(true);
-                }
-            }
-
-            {
-                // vsync - don't count as frame-time:
-                frame_timer.pause();
-                profiling::scope!("swap_buffers");
-                let context = current_gl_context.as_ref().ok_or_else(|| {
-                    egui_glow::PainterError::from(
-                        "failed to get current context to swap buffers".to_owned(),
-                    )
-                })?;
-
-                // On Wayland this makes winit hold back the next `RedrawRequested` until the
-                // compositor sends a frame callback. That is our frame pacing there, since we
-                // swap with interval 0 on Wayland (see `GlutinWindowContext::new`).
-                // egui-wgpu does the same. A no-op on other platforms.
-                window.pre_present_notify();
-                set_swap_interval(
-                    viewport_id,
-                    &viewport.info,
-                    &mut viewport.swap_waits,
-                    waits(*swap_interval),
-                    gl_surface,
-                    context,
-                );
-                gl_surface.swap_buffers(context)?;
-                frame_timer.resume();
-            }
-
-            // give it time to settle:
-            #[cfg(feature = "__screenshot")]
-            if integration.egui_ctx.cumulative_pass_nr() == 2
-                && let Ok(path) = std::env::var("EFRAME_SCREENSHOT_TO")
-            {
-                save_screenshot_and_exit(&path, &painter, screen_size_in_pixels);
             }
         }
 
@@ -1003,9 +1042,9 @@ impl GlowWinitRunning<'_> {
         sleep_if_invisible_or_minimized(Some(&window));
 
         if integration.should_close() {
-            Ok(EventResult::CloseRequested)
+            EventResult::CloseRequested
         } else {
-            Ok(EventResult::Wait)
+            EventResult::Wait
         }
     }
 
@@ -1187,13 +1226,43 @@ fn set_swap_interval(
     *swap_waits = wants;
 }
 
-fn change_gl_context(
-    current_gl_context: &mut Option<glutin::context::PossiblyCurrentContext>,
-    not_current_gl_context: &mut Option<glutin::context::NotCurrentContext>,
+/// What [`change_gl_context`] asks of the OpenGL context: a trait, so a test can give it a
+/// context whose `make_current` fails.
+trait SwitchableContext<S> {
+    /// The context is this thread's current one, and current on `surface`.
+    fn is_current_on(&self, surface: &S) -> bool;
+
+    /// Makes the context current on `surface`, keeping it whatever happens.
+    fn make_current_on(&self, surface: &S) -> glutin::error::Result<()>;
+}
+
+type GlSurface = glutin::surface::Surface<glutin::surface::WindowSurface>;
+
+impl SwitchableContext<GlSurface> for glutin::context::PossiblyCurrentContext {
+    fn is_current_on(&self, surface: &GlSurface) -> bool {
+        self.is_current() && surface.is_current(self)
+    }
+
+    fn make_current_on(&self, surface: &GlSurface) -> glutin::error::Result<()> {
+        // `PossiblyCurrentGlContext::make_current` borrows the context: when it fails, the
+        // context is still there for the next try (see `GlutinWindowContext::gl_context`).
+        // Making it current on another surface also makes it not current on the last one.
+        self.make_current(surface)
+    }
+}
+
+/// Makes the OpenGL context current on `viewport_id`'s surface, unless it already is.
+///
+/// The driver can fail to: some Intel drivers on Windows fail `wglMakeCurrent` now and then
+/// ("An attempt was made to reference a token that does not exist", or no error code at all),
+/// while a window is destroyed or hidden, on a desktop switch, or under memory pressure. The
+/// error is returned, the context is kept, current on no viewport, and the next call tries again.
+fn change_gl_context<S>(
+    gl_context: &impl SwitchableContext<S>,
     current_viewport: &mut Option<ViewportId>,
     viewport_id: ViewportId,
-    gl_surface: &glutin::surface::Surface<glutin::surface::WindowSurface>,
-) {
+    gl_surface: &S,
+) -> glutin::error::Result<()> {
     profiling::function_scope!();
 
     // Early-out to save a lot of time: switching context is expensive,
@@ -1210,30 +1279,131 @@ fn change_gl_context(
     // else on the main thread (AppKit) can clear or change the thread's current context while
     // that view stays attached. Trusting the view alone, OpenGL calls would then go to no
     // context at all: `glGenTextures` gives 0 and egui_glow can't create a texture.
-    if *current_viewport == Some(viewport_id)
-        && let Some(current_gl_context) = current_gl_context
-    {
+    if *current_viewport == Some(viewport_id) {
         profiling::scope!("is_current");
-        if current_gl_context.is_current() && gl_surface.is_current(current_gl_context) {
-            return;
+        if gl_context.is_current_on(gl_surface) {
+            return Ok(());
         }
     }
 
-    let not_current = if let Some(not_current_context) = not_current_gl_context.take() {
-        not_current_context
-    } else {
-        profiling::scope!("make_not_current");
-        *current_viewport = None;
-        current_gl_context
-            .take()
-            .unwrap()
-            .make_not_current()
-            .unwrap()
-    };
-
     profiling::scope!("make_current");
-    *current_gl_context = Some(not_current.make_current(gl_surface).unwrap());
+    *current_viewport = None;
+    gl_context.make_current_on(gl_surface)?;
     *current_viewport = Some(viewport_id);
+    Ok(())
+}
+
+/// Before painting a viewport: the context made current on its surface, which it returns; or why
+/// it can't paint now (no surface: one couldn't be made for its window; or the switch failed).
+fn switch_to_paint<'s, S>(
+    gl_context: &impl SwitchableContext<S>,
+    current_viewport: &mut Option<ViewportId>,
+    viewport_id: ViewportId,
+    gl_surface: Option<&'s S>,
+) -> core::result::Result<&'s S, String> {
+    let Some(gl_surface) = gl_surface else {
+        return Err("its window has no OpenGL surface".to_owned());
+    };
+    #[cfg(debug_assertions)]
+    if injected::make_current_fails() {
+        *current_viewport = None;
+        return Err("couldn't make the OpenGL context current: \
+                    EFRAME_TEST_GL_MAKE_CURRENT_FAILS (a test)"
+            .to_owned());
+    }
+    change_gl_context(gl_context, current_viewport, viewport_id, gl_surface)
+        .map(|()| gl_surface)
+        .map_err(|err| format!("couldn't make the OpenGL context current: {err}"))
+}
+
+/// How long a viewport that couldn't be painted waits before it tries again.
+const PAINT_AGAIN_AFTER: core::time::Duration = core::time::Duration::from_millis(100);
+
+/// A viewport's paints in a row that failed.
+#[derive(Debug, Default)]
+struct PaintFailures {
+    in_a_row: u32,
+    since: Option<Instant>,
+}
+
+impl PaintFailures {
+    /// One more failed at `now`: how many in a row, and for how long since the first of them.
+    fn failed(&mut self, now: Instant) -> (u32, core::time::Duration) {
+        self.in_a_row = self.in_a_row.saturating_add(1);
+        let since = *self.since.get_or_insert(now);
+        (self.in_a_row, now.saturating_duration_since(since))
+    }
+
+    /// A paint went through: how many had failed in a row before it.
+    fn painted(&mut self) -> u32 {
+        self.since = None;
+        core::mem::take(&mut self.in_a_row)
+    }
+}
+
+/// `viewport_id` couldn't be painted (`error`): logged (the first of a run, then at 2, 4, 8…
+/// in a row), told to the app ([`super::ViewportHooks::gl_paint_failed`]), and `repaint`
+/// (the viewport, or the parent that paints an immediate one) is painted again shortly.
+fn paint_failed(
+    egui_ctx: &egui::Context,
+    viewport_id: ViewportId,
+    repaint: ViewportId,
+    failures: &mut PaintFailures,
+    error: &str,
+) {
+    let (in_a_row, failing_for) = failures.failed(Instant::now());
+    if in_a_row.is_power_of_two() {
+        log::warn!("{viewport_id:?} not painted ({in_a_row} in a row): {error}");
+    }
+    super::viewport_hooks::with(|hooks| {
+        hooks.gl_paint_failed(viewport_id, error, in_a_row, failing_for);
+    });
+    egui_ctx.request_repaint_after_for(PAINT_AGAIN_AFTER, repaint);
+}
+
+/// `viewport_id` was painted and its frame shown.
+fn painted(viewport_id: ViewportId, failures: &mut PaintFailures) {
+    let failed = failures.painted();
+    if failed > 0 {
+        log::info!("{viewport_id:?} painted again, after {failed} paints that failed");
+    }
+}
+
+/// Resizes a surface the context is current on.
+fn resize_surface(
+    gl_context: &glutin::context::PossiblyCurrentContext,
+    gl_surface: &GlSurface,
+    physical_size: winit::dpi::PhysicalSize<u32>,
+) {
+    let width_px = NonZeroU32::new(physical_size.width).unwrap_or(NonZeroU32::MIN);
+    let height_px = NonZeroU32::new(physical_size.height).unwrap_or(NonZeroU32::MIN);
+    gl_surface.resize(gl_context, width_px, height_px);
+}
+
+/// Debug builds only: a driver's failure, made on purpose.
+#[cfg(debug_assertions)]
+mod injected {
+    use core::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::OnceLock;
+
+    /// `EFRAME_TEST_GL_MAKE_CURRENT_FAILS=<n>` (read once): the next `n` switches of the context
+    /// to a viewport about to be painted fail, as a driver's `wglMakeCurrent` does now and then,
+    /// so the way back can be tried. Never in release builds.
+    pub(super) fn make_current_fails() -> bool {
+        static LEFT: OnceLock<AtomicU32> = OnceLock::new();
+        let left = LEFT.get_or_init(|| {
+            let n = std::env::var("EFRAME_TEST_GL_MAKE_CURRENT_FAILS")
+                .ok()
+                .and_then(|v| v.trim().parse().ok())
+                .unwrap_or(0);
+            if n > 0 {
+                log::warn!("Testing: the next {n} OpenGL context switches before a paint fail");
+            }
+            AtomicU32::new(n)
+        });
+        left.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
+            .is_ok()
+    }
 }
 
 impl GlutinWindowContext {
@@ -1374,7 +1544,9 @@ impl GlutinWindowContext {
                     .create_context(&gl_config, context_attributes)
             },
         )?;
-        let not_current_gl_context = Some(gl_context);
+        // Kept possibly current from now on, and made current on a surface with the make_current
+        // that borrows it (see GlutinWindowContext::gl_context).
+        let gl_context = gl_context.treat_as_possibly_current();
 
         let mut viewport_from_window = HashMap::default();
         let mut window_from_viewport = OrderedViewportIdMap::default();
@@ -1414,6 +1586,8 @@ impl GlutinWindowContext {
                 egui_winit: None,
                 show_after_first_paint: false,
                 swap_waits: false,
+                paint_failures: PaintFailures::default(),
+                resize_pending: false,
             },
         );
 
@@ -1426,8 +1600,7 @@ impl GlutinWindowContext {
             egui_ctx: egui_ctx.clone(),
             swap_interval,
             gl_config,
-            current_gl_context: None,
-            not_current_gl_context,
+            gl_context,
             current_viewport: None,
             viewports,
             viewport_from_window,
@@ -1550,24 +1723,15 @@ impl GlutinWindowContext {
 
             log::trace!("surface created successfully: {gl_surface:?}. making context current");
 
-            let not_current_gl_context =
-                if let Some(not_current_context) = self.not_current_gl_context.take() {
-                    not_current_context
-                } else {
-                    self.current_viewport = None;
-                    self.current_gl_context
-                        .take()
-                        .unwrap()
-                        .make_not_current()
-                        .unwrap()
-                };
-            let current_gl_context = not_current_gl_context.make_current(&gl_surface)?;
+            // A failure drops the new surface and keeps the context: the next pass makes the
+            // surface again (`handle_viewport_output`), and the viewport isn't painted meanwhile.
+            self.current_viewport = None;
+            self.gl_context.make_current_on(&gl_surface)?;
             self.current_viewport = Some(viewport_id);
 
             // try setting swap interval. but its not absolutely necessary, so don't panic on failure.
             log::trace!("made context current. setting swap interval for surface");
-            if let Err(err) = gl_surface.set_swap_interval(&current_gl_context, self.swap_interval)
-            {
+            if let Err(err) = gl_surface.set_swap_interval(&self.gl_context, self.swap_interval) {
                 log::warn!("Failed to set swap interval due to error: {err}");
             }
             viewport.swap_waits = waits(self.swap_interval);
@@ -1576,8 +1740,7 @@ impl GlutinWindowContext {
             // create window/surface/make context current once and just use them forever.
 
             viewport.gl_surface = Some(gl_surface);
-
-            self.current_gl_context = Some(current_gl_context);
+            viewport.resize_pending = false;
         }
 
         // This runs on every frame; report a window only when it is new for this viewport.
@@ -1590,20 +1753,18 @@ impl GlutinWindowContext {
     }
 
     /// only applies for android. but we basically drop surface + window and make context not current
-    fn on_suspend(&mut self) -> Result {
+    fn on_suspend(&mut self) {
         log::debug!("received suspend event. dropping window and surface");
         for viewport in self.viewports.values_mut() {
             viewport.gl_surface = None;
             viewport.window = None;
         }
         self.current_viewport = None;
-        if let Some(current) = self.current_gl_context.take() {
-            log::debug!("context is current, so making it non-current");
-            self.not_current_gl_context = Some(current.make_not_current()?);
-        } else {
-            log::debug!("context is already not current??? could be duplicate suspend event");
+        log::debug!("making the context not current");
+        // Kept either way: the next viewport to paint makes it current again.
+        if let Err(err) = self.gl_context.make_not_current_in_place() {
+            log::warn!("Failed to make the OpenGL context not current: {err}");
         }
-        Ok(())
     }
 
     fn viewport(&self, viewport_id: ViewportId) -> &Viewport {
@@ -1622,26 +1783,22 @@ impl GlutinWindowContext {
     }
 
     fn resize(&mut self, viewport_id: ViewportId, physical_size: winit::dpi::PhysicalSize<u32>) {
-        let width_px = NonZeroU32::new(physical_size.width).unwrap_or(NonZeroU32::MIN);
-        let height_px = NonZeroU32::new(physical_size.height).unwrap_or(NonZeroU32::MIN);
-
-        if let Some(viewport) = self.viewports.get(&viewport_id)
+        if let Some(viewport) = self.viewports.get_mut(&viewport_id)
             && let Some(gl_surface) = &viewport.gl_surface
         {
-            change_gl_context(
-                &mut self.current_gl_context,
-                &mut self.not_current_gl_context,
+            match change_gl_context(
+                &self.gl_context,
                 &mut self.current_viewport,
                 viewport_id,
                 gl_surface,
-            );
-            gl_surface.resize(
-                self.current_gl_context
-                    .as_ref()
-                    .expect("failed to get current context to resize surface"),
-                width_px,
-                height_px,
-            );
+            ) {
+                Ok(()) => resize_surface(&self.gl_context, gl_surface, physical_size),
+                Err(err) => {
+                    // Its next paint resizes it, at the window's size then.
+                    log::debug!("{viewport_id:?} resized later: {err}");
+                    viewport.resize_pending = true;
+                }
+            }
         }
     }
 
@@ -1795,6 +1952,8 @@ fn initialize_or_update_viewport<'a>(
                 gl_surface: None,
                 show_after_first_paint: false,
                 swap_waits: false,
+                paint_failures: PaintFailures::default(),
+                resize_pending: false,
             })
         }
 
@@ -1938,8 +2097,7 @@ fn render_immediate_viewport(
     let mut glutin = glutin.borrow_mut();
 
     let GlutinWindowContext {
-        current_gl_context,
-        not_current_gl_context,
+        gl_context,
         current_viewport,
         viewports,
         pending_delta,
@@ -1957,59 +2115,75 @@ fn render_immediate_viewport(
 
     viewport.info.events.clear(); // they should have been processed
 
-    let (Some(egui_winit), Some(window), Some(gl_surface)) = (
-        &mut viewport.egui_winit,
-        &viewport.window,
-        &viewport.gl_surface,
-    ) else {
+    let (Some(egui_winit), Some(window)) = (&mut viewport.egui_winit, &viewport.window) else {
         return;
     };
 
     let screen_size_in_pixels: [u32; 2] = window.inner_size().into();
 
-    change_gl_context(
-        current_gl_context,
-        not_current_gl_context,
+    // Its parent's pass paints it: that one is painted again when this one couldn't be.
+    let repaint = viewport.ids.parent;
+    match switch_to_paint(
+        gl_context,
         current_viewport,
         viewport_id,
-        gl_surface,
-    );
+        viewport.gl_surface.as_ref(),
+    ) {
+        Err(error) => {
+            // Not painted: its texture changes wait in `pending_delta` for the next paint.
+            paint_failed(
+                egui_ctx,
+                viewport_id,
+                repaint,
+                &mut viewport.paint_failures,
+                &error,
+            );
+        }
+        Ok(gl_surface) => {
+            if core::mem::take(&mut viewport.resize_pending) {
+                resize_surface(gl_context, gl_surface, window.inner_size());
+            }
 
-    let current_gl_context = current_gl_context.as_ref().unwrap();
+            if !gl_surface.is_current(gl_context) {
+                log::error!(
+                    "egui::show_viewport_immediate: viewport {:?} ({:?}) was not created on main thread.",
+                    viewport.ids.this,
+                    viewport.builder.title
+                );
+            }
 
-    if !gl_surface.is_current(current_gl_context) {
-        log::error!(
-            "egui::show_viewport_immediate: viewport {:?} ({:?}) was not created on main thread.",
-            viewport.ids.this,
-            viewport.builder.title
-        );
-    }
+            egui_glow::painter::clear(
+                painter.borrow().gl(),
+                screen_size_in_pixels,
+                [0.0, 0.0, 0.0, 0.0],
+            );
 
-    egui_glow::painter::clear(
-        painter.borrow().gl(),
-        screen_size_in_pixels,
-        [0.0, 0.0, 0.0, 0.0],
-    );
+            painter.borrow_mut().paint_and_update_textures(
+                screen_size_in_pixels,
+                pixels_per_point,
+                &clipped_primitives,
+                pending_delta,
+            );
 
-    painter.borrow_mut().paint_and_update_textures(
-        screen_size_in_pixels,
-        pixels_per_point,
-        &clipped_primitives,
-        pending_delta,
-    );
-
-    {
-        profiling::scope!("swap_buffers");
-        set_swap_interval(
-            viewport_id,
-            &viewport.info,
-            &mut viewport.swap_waits,
-            waits(*swap_interval),
-            gl_surface,
-            current_gl_context,
-        );
-        if let Err(err) = gl_surface.swap_buffers(current_gl_context) {
-            log::error!("swap_buffers failed: {err}");
+            profiling::scope!("swap_buffers");
+            set_swap_interval(
+                viewport_id,
+                &viewport.info,
+                &mut viewport.swap_waits,
+                waits(*swap_interval),
+                gl_surface,
+                gl_context,
+            );
+            match gl_surface.swap_buffers(gl_context) {
+                Ok(()) => painted(viewport_id, &mut viewport.paint_failures),
+                Err(err) => paint_failed(
+                    egui_ctx,
+                    viewport_id,
+                    repaint,
+                    &mut viewport.paint_failures,
+                    &format!("swap_buffers failed: {err}"),
+                ),
+            }
         }
     }
     if core::mem::take(&mut viewport.show_after_first_paint) {
@@ -2114,7 +2288,117 @@ fn save_screenshot_and_exit(
 
 #[cfg(test)]
 mod tests {
-    use super::{context_attributes_to_try, create_first_context};
+    use core::cell::Cell;
+    use core::time::Duration;
+    use std::time::Instant;
+
+    use egui::ViewportId;
+
+    use super::{
+        PaintFailures, SwitchableContext, change_gl_context, context_attributes_to_try,
+        create_first_context, switch_to_paint,
+    };
+
+    /// A surface: its viewport's number.
+    #[derive(Debug, PartialEq, Eq)]
+    struct FakeSurface(u32);
+
+    /// A context whose `make_current` fails while `failing` is set, as a driver's
+    /// `wglMakeCurrent` does now and then (#1448's Intel HD Graphics 520: error 1008, or 0).
+    #[derive(Default)]
+    struct FakeContext {
+        current_on: Cell<Option<u32>>,
+        failing: Cell<Option<i64>>,
+        switches: Cell<u32>,
+    }
+
+    impl SwitchableContext<FakeSurface> for FakeContext {
+        fn is_current_on(&self, surface: &FakeSurface) -> bool {
+            self.current_on.get() == Some(surface.0)
+        }
+
+        fn make_current_on(&self, surface: &FakeSurface) -> glutin::error::Result<()> {
+            self.switches.set(self.switches.get() + 1);
+            if let Some(code) = self.failing.get() {
+                // As wglMakeCurrent: the thread's current context is gone too.
+                self.current_on.set(None);
+                return Err(std::io::Error::from_raw_os_error(code as i32).into());
+            }
+            self.current_on.set(Some(surface.0));
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_failed_switch_keeps_the_context_and_the_next_one_tries_again() {
+        let context = FakeContext::default();
+        let mut current = None;
+        let (main, dialog) = (ViewportId::ROOT, ViewportId::from_hash_of("dialog"));
+
+        change_gl_context(&context, &mut current, main, &FakeSurface(1)).unwrap();
+        assert_eq!(current, Some(main));
+
+        // A switch to the dialog fails: an error, not a panic, and current on nothing.
+        context.failing.set(Some(1008));
+        let err = change_gl_context(&context, &mut current, dialog, &FakeSurface(2)).unwrap_err();
+        assert_eq!(err.raw_code(), Some(1008));
+        assert_eq!(current, None);
+
+        // Back on the main window, the same context is switched again (not taken for current).
+        let err = change_gl_context(&context, &mut current, main, &FakeSurface(1)).unwrap_err();
+        assert_eq!(err.raw_code(), Some(1008));
+        // And a failure without an error code ("The operation completed successfully").
+        context.failing.set(Some(0));
+        let err = change_gl_context(&context, &mut current, main, &FakeSurface(1)).unwrap_err();
+        assert_eq!(err.raw_code(), Some(0));
+        assert_eq!(current, None);
+
+        // The driver works again: the same context draws.
+        context.failing.set(None);
+        change_gl_context(&context, &mut current, dialog, &FakeSurface(2)).unwrap();
+        assert_eq!(current, Some(dialog));
+        assert_eq!(context.current_on.get(), Some(2));
+
+        // Already current there: no switch at all.
+        let switches = context.switches.get();
+        change_gl_context(&context, &mut current, dialog, &FakeSurface(2)).unwrap();
+        assert_eq!(context.switches.get(), switches);
+    }
+
+    #[test]
+    fn a_viewport_without_a_surface_or_whose_switch_fails_is_not_painted() {
+        let context = FakeContext::default();
+        let mut current = None;
+        let dialog = ViewportId::from_hash_of("dialog");
+
+        let none: Option<&FakeSurface> = None;
+        let why = switch_to_paint(&context, &mut current, dialog, none).unwrap_err();
+        assert!(why.contains("no OpenGL surface"), "{why}");
+
+        context.failing.set(Some(1008));
+        let surface = FakeSurface(2);
+        let why = switch_to_paint(&context, &mut current, dialog, Some(&surface)).unwrap_err();
+        assert!(
+            why.contains("couldn't make the OpenGL context current"),
+            "{why}"
+        );
+
+        context.failing.set(None);
+        let painted_on = switch_to_paint(&context, &mut current, dialog, Some(&surface)).unwrap();
+        assert_eq!(painted_on, &surface);
+    }
+
+    #[test]
+    fn paint_failures_count_a_run_and_start_again_after_a_paint() {
+        let mut failures = PaintFailures::default();
+        let start = Instant::now();
+        assert_eq!(failures.failed(start), (1, Duration::ZERO));
+        let later = start + Duration::from_millis(250);
+        assert_eq!(failures.failed(later), (2, Duration::from_millis(250)));
+        assert_eq!(failures.painted(), 2);
+        assert_eq!(failures.painted(), 0);
+        assert_eq!(failures.failed(later), (1, Duration::ZERO));
+    }
 
     #[test]
     fn context_attributes_end_with_compatibility_profile() {

@@ -33,11 +33,11 @@ use egui::{
 use egui_winit::accesskit_winit;
 use log::warn;
 
+use super::pending_textures::PendingTextures;
 use super::{
     epi_integration, event_loop_context,
     winit_integration::{EventResult, PassMode, UserEvent, WinitApp, create_egui_context},
 };
-use crate::epaint::textures::TexturesDelta;
 use crate::{
     App, AppCreator, CreationContext, NativeOptions, Result, Storage,
     native::{epi_integration::EpiIntegration, winit_integration::sleep_if_invisible_or_minimized},
@@ -74,16 +74,6 @@ struct GlowWinitRunning<'app> {
 
     // NOTE: one painter shared by all viewports.
     painter: Rc<RefCell<egui_glow::Painter>>,
-
-    /// Any not yet applied deltas for this app.
-    pending_deltas: TexturesDelta,
-}
-
-impl Drop for GlowWinitRunning<'_> {
-    fn drop(&mut self) {
-        // Avoid debug panic when dropping unapplied deltas on teardown
-        self.pending_deltas.clear();
-    }
 }
 
 /// This struct will contain both persistent and temporary glutin state.
@@ -129,6 +119,10 @@ struct GlutinWindowContext {
     /// See <https://github.com/emilk/egui/issues/4289>.
     current_viewport: Option<ViewportId>,
 
+    /// The texture changes of every viewport not yet given to the painter, which holds the
+    /// textures of them all (see [`PendingTextures`]).
+    pending_textures: PendingTextures,
+
     viewports: OrderedViewportIdMap<Viewport>,
     viewport_from_window: HashMap<WindowId, ViewportId>,
     window_from_viewport: OrderedViewportIdMap<WindowId>,
@@ -148,9 +142,6 @@ struct Viewport {
     deferred_commands: Vec<egui::viewport::ViewportCommand>,
     info: ViewportInfo,
     actions_requested: Vec<egui_winit::ActionRequested>,
-
-    /// Any not yet applied deltas for this viewport.
-    pending_delta: TexturesDelta,
 
     /// The user-callback that shows the ui.
     /// None for immediate viewports.
@@ -206,13 +197,6 @@ impl Viewport {
             state,
             &mut self.actions_requested,
         );
-    }
-}
-
-impl Drop for Viewport {
-    fn drop(&mut self) {
-        // Avoid debug panic when dropping unapplied deltas on teardown
-        self.pending_delta.clear();
     }
 }
 
@@ -487,7 +471,6 @@ impl<'app> GlowWinitApp<'app> {
             app,
             glutin,
             painter,
-            pending_deltas: Default::default(),
         }))
     }
 }
@@ -853,7 +836,6 @@ impl GlowWinitRunning<'_> {
             app,
             glutin,
             painter,
-            pending_deltas,
             ..
         } = self;
 
@@ -867,7 +849,7 @@ impl GlowWinitRunning<'_> {
             pixels_per_point,
             mut viewport_output,
         } = full_output;
-        pending_deltas.append(textures_delta);
+        glutin.pending_textures.append(textures_delta);
 
         glutin.remove_viewports_not_in(&viewport_output);
 
@@ -876,6 +858,7 @@ impl GlowWinitRunning<'_> {
             gl_context,
             current_viewport,
             swap_interval,
+            pending_textures,
             ..
         } = &mut *glutin;
 
@@ -909,6 +892,8 @@ impl GlowWinitRunning<'_> {
 
         egui_winit.handle_platform_output_with_event_loop(&window, event_loop, platform_output);
 
+        // Whether this frame's textures were given to the painter by its paint.
+        let mut drawn = false;
         if is_visible {
             let clipped_primitives = integration.egui_ctx.tessellate(shapes, pixels_per_point);
 
@@ -924,8 +909,9 @@ impl GlowWinitRunning<'_> {
 
             match switched {
                 Err(error) => {
-                    // Not painted: the texture changes wait in `pending_deltas`, the requested
-                    // actions in `actions_requested`, for the next paint.
+                    // Not painted: the texture changes wait in `pending_textures` for the next
+                    // paint of any window, the requested actions in `actions_requested` for this
+                    // one's.
                     paint_failed(
                         &integration.egui_ctx,
                         viewport_id,
@@ -945,12 +931,14 @@ impl GlowWinitRunning<'_> {
                         painter.clear(screen_size_in_pixels, clear_color);
                     }
 
+                    // The frame's last paint: every window's changes, the frees too.
                     painter.paint_and_update_textures(
                         screen_size_in_pixels,
                         pixels_per_point,
                         &clipped_primitives,
-                        pending_deltas,
+                        pending_textures.all(),
                     );
+                    drawn = true;
 
                     {
                         let mut screenshot_callbacks = Vec::new();
@@ -1029,6 +1017,14 @@ impl GlowWinitRunning<'_> {
                     }
                 }
             }
+        }
+
+        // Not painted (hidden, minimized, or its paint failed) while its immediate viewports may
+        // have been: the textures they let go are freed now, if the context is current on one of
+        // them (deleting a texture needs a current context, on any of its surfaces). The new
+        // ones wait for whichever window paints next.
+        if !drawn && current_viewport.is_some() {
+            pending_textures.free_now(|id| painter.free_texture(id));
         }
 
         glutin.handle_viewport_output(event_loop, &integration.egui_ctx, &viewport_output);
@@ -1580,7 +1576,6 @@ impl GlutinWindowContext {
                 deferred_commands: vec![],
                 info: viewport_info,
                 actions_requested: Default::default(),
-                pending_delta: Default::default(),
                 viewport_ui_cb: None,
                 gl_surface: None,
                 window: window.map(Arc::new),
@@ -1602,6 +1597,7 @@ impl GlutinWindowContext {
             gl_config,
             gl_context,
             current_viewport: None,
+            pending_textures: PendingTextures::default(),
             viewports,
             viewport_from_window,
             max_texture_side: None,
@@ -1938,7 +1934,6 @@ fn initialize_or_update_viewport<'a>(
                 deferred_commands: vec![],
                 info: Default::default(),
                 actions_requested: Default::default(),
-                pending_delta: Default::default(),
                 viewport_ui_cb,
                 window: None,
                 egui_winit: None,
@@ -2093,14 +2088,17 @@ fn render_immediate_viewport(
         current_viewport,
         viewports,
         swap_interval,
+        pending_textures,
         ..
     } = &mut *glutin;
+
+    // Every window's, before anything returns: another window may draw these textures.
+    pending_textures.append(textures_delta);
 
     let Some(viewport) = viewports.get_mut(&viewport_id) else {
         warn!("Viewport disappeared unexpectedly!");
         return;
     };
-    viewport.pending_delta.append(textures_delta);
 
     viewport.info.events.clear(); // they should have been processed
 
@@ -2119,7 +2117,7 @@ fn render_immediate_viewport(
         viewport.gl_surface.as_ref(),
     ) {
         Err(error) => {
-            // Not painted: its texture changes wait in `pending_delta` for the next paint.
+            // Not painted: the texture changes wait in `pending_textures` for the next paint.
             paint_failed(
                 egui_ctx,
                 viewport_id,
@@ -2147,12 +2145,16 @@ fn render_immediate_viewport(
                 [0.0, 0.0, 0.0, 0.0],
             );
 
-            painter.borrow_mut().paint_and_update_textures(
-                screen_size_in_pixels,
-                pixels_per_point,
-                &clipped_primitives,
-                &mut viewport.pending_delta,
-            );
+            // Inside its parent's frame: the parent paints after it, with shapes that can use a
+            // texture freed meanwhile, so the frees wait for the parent's paint.
+            pending_textures.without_frees(|delta| {
+                painter.borrow_mut().paint_and_update_textures(
+                    screen_size_in_pixels,
+                    pixels_per_point,
+                    &clipped_primitives,
+                    delta,
+                );
+            });
 
             profiling::scope!("swap_buffers");
             set_swap_interval(

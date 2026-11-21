@@ -18,7 +18,7 @@ use winit::{
 
 use ahash::HashMap;
 use egui::{
-    DeferredViewportUiCallback, FullOutput, ImmediateViewport, OrderedViewportIdMap, TexturesDelta,
+    DeferredViewportUiCallback, FullOutput, ImmediateViewport, OrderedViewportIdMap,
     ViewportBuilder, ViewportClass, ViewportId, ViewportIdPair, ViewportIdSet, ViewportInfo,
     ViewportOutput,
 };
@@ -35,6 +35,7 @@ use crate::{
     },
 };
 
+use super::pending_textures::PendingTextures;
 use super::{epi_integration, event_loop_context, winit_integration, winit_integration::WinitApp};
 
 // ----------------------------------------------------------------------------
@@ -67,15 +68,6 @@ struct WgpuWinitRunning<'app> {
 
     /// Wrapped in an `Rc<RefCell<…>>` so it can be re-entrantly shared via a weak-pointer.
     shared: Rc<RefCell<SharedState>>,
-
-    pending_deltas: TexturesDelta,
-}
-
-impl Drop for WgpuWinitRunning<'_> {
-    fn drop(&mut self) {
-        // Avoid debug panic when dropping unapplied deltas on teardown
-        self.pending_deltas.clear();
-    }
 }
 
 /// Everything needed by the immediate viewport renderer.\
@@ -87,6 +79,11 @@ pub struct SharedState {
     egui_ctx: egui::Context,
     viewports: Viewports,
     painter: egui_wgpu::winit::Painter,
+
+    /// The texture changes of every viewport not yet given to the painter, which holds the
+    /// textures of them all (see [`PendingTextures`]).
+    pending_textures: PendingTextures,
+
     viewport_from_window: HashMap<WindowId, ViewportId>,
     focused_viewport: Option<ViewportId>,
     resized_viewport: Option<ViewportId>,
@@ -110,9 +107,6 @@ pub struct Viewport {
     info: ViewportInfo,
     actions_requested: Vec<ActionRequested>,
 
-    /// Any not yet applied deltas for this viewport.
-    pending_delta: TexturesDelta,
-
     /// `None` for sync viewports.
     viewport_ui_cb: Option<Arc<DeferredViewportUiCallback>>,
 
@@ -122,13 +116,6 @@ pub struct Viewport {
 
     /// `window` and `egui_winit` are initialized together.
     egui_winit: Option<egui_winit::State>,
-}
-
-impl Drop for Viewport {
-    fn drop(&mut self) {
-        // Avoid debug panic when dropping unapplied deltas on teardown
-        self.pending_delta.clear();
-    }
 }
 
 // ----------------------------------------------------------------------------
@@ -375,7 +362,6 @@ impl<'app> WgpuWinitApp<'app> {
                 viewport_ui_cb: None,
                 window: Some(window),
                 egui_winit: Some(egui_winit),
-                pending_delta: Default::default(),
             },
         );
 
@@ -384,6 +370,7 @@ impl<'app> WgpuWinitApp<'app> {
             viewport_from_window,
             viewports,
             painter,
+            pending_textures: PendingTextures::default(),
             focused_viewport: Some(ViewportId::ROOT),
             resized_viewport: None,
             clipboard_shortcuts: self.native_options.clipboard_shortcuts,
@@ -409,7 +396,6 @@ impl<'app> WgpuWinitApp<'app> {
             integration,
             app,
             shared,
-            pending_deltas: Default::default(),
         }))
     }
 }
@@ -647,7 +633,6 @@ impl WgpuWinitRunning<'_> {
             app,
             integration,
             shared,
-            pending_deltas,
         } = self;
 
         let mut frame_timer = crate::stopwatch::Stopwatch::new();
@@ -800,6 +785,7 @@ impl WgpuWinitRunning<'_> {
             egui_ctx,
             viewports,
             painter,
+            pending_textures,
             viewport_from_window,
             ..
         } = &mut *shared_mut;
@@ -812,7 +798,7 @@ impl WgpuWinitRunning<'_> {
             mut viewport_output,
         } = full_output;
 
-        pending_deltas.append(textures_delta);
+        pending_textures.append(textures_delta);
 
         remove_viewports_not_in(viewports, painter, viewport_from_window, &viewport_output);
 
@@ -872,7 +858,8 @@ impl WgpuWinitRunning<'_> {
                 pixels_per_point,
                 app.clear_color(&egui_ctx.global_style().visuals),
                 &clipped_primitives,
-                pending_deltas,
+                // The frame's last paint: every window's changes, the frees too.
+                pending_textures.all(),
                 screenshot_commands,
                 window,
             );
@@ -901,6 +888,13 @@ impl WgpuWinitRunning<'_> {
 
             vsync_secs
         } else {
+            // Not painted (hidden, minimized) while its immediate viewports may have been: the
+            // textures they let go are freed now. The new ones wait for whichever window paints
+            // next.
+            if let Some(render_state) = painter.render_state() {
+                let mut renderer = render_state.renderer.write();
+                pending_textures.free_now(|id| renderer.free_texture(&id));
+            }
             0.0
         };
 
@@ -1341,15 +1335,18 @@ fn render_immediate_viewport(
     let SharedState {
         viewports,
         painter,
+        pending_textures,
         viewport_from_window,
         ..
     } = &mut *shared_mut;
+
+    // Every window's, before anything returns: another window may draw these textures.
+    pending_textures.append(textures_delta);
 
     let Some(viewport) = viewports.get_mut(&ids.this) else {
         warn!("Viewport disappeared unexpectedly!");
         return;
     };
-    viewport.pending_delta.append(textures_delta);
 
     viewport.info.events.clear(); // they should have been processed
     let (Some(egui_winit), Some(window)) = (&mut viewport.egui_winit, &viewport.window) else {
@@ -1368,15 +1365,19 @@ fn render_immediate_viewport(
     }
 
     let clipped_primitives = egui_ctx.tessellate(shapes, pixels_per_point);
-    painter.paint_and_update_textures(
-        ids.this,
-        pixels_per_point,
-        [0.0, 0.0, 0.0, 0.0],
-        &clipped_primitives,
-        &mut viewport.pending_delta,
-        vec![],
-        window,
-    );
+    // Inside its parent's frame: the parent paints after it, with shapes that can use a texture
+    // freed meanwhile, so the frees wait for the parent's paint.
+    pending_textures.without_frees(|delta| {
+        painter.paint_and_update_textures(
+            ids.this,
+            pixels_per_point,
+            [0.0, 0.0, 0.0, 0.0],
+            &clipped_primitives,
+            delta,
+            vec![],
+            window,
+        )
+    });
 
     // As in the regular frame path, an `IMEAllowed` command must take effect before this
     // pass publishes surrounding text.
@@ -1526,7 +1527,6 @@ fn initialize_or_update_viewport<'a>(
                 viewport_ui_cb,
                 window: None,
                 egui_winit: None,
-                pending_delta: Default::default(),
             })
         }
 

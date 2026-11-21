@@ -88,7 +88,7 @@ mod tests {
     use egui::epaint::{ClippedPrimitive, Primitive};
     use egui::{
         Color32, ColorImage, Context, ImmediateViewport, Pos2, RawInput, Rect, TextureHandle,
-        TextureOptions, ViewportBuilder, ViewportId, pos2, vec2,
+        TextureOptions, ViewportBuilder, ViewportId, ViewportInfo, pos2, vec2,
     };
 
     use super::*;
@@ -97,6 +97,8 @@ mod tests {
     #[derive(Default)]
     struct Painter {
         textures: HashSet<TextureId>,
+        /// The textures its paints drew.
+        drawn: HashSet<TextureId>,
         /// The textures a paint drew that it didn't have.
         missing: Vec<TextureId>,
     }
@@ -108,10 +110,11 @@ mod tests {
                 self.textures.insert(id);
             }
             for p in primitives {
-                if let Primitive::Mesh(mesh) = &p.primitive
-                    && !self.textures.contains(&mesh.texture_id)
-                {
-                    self.missing.push(mesh.texture_id);
+                if let Primitive::Mesh(mesh) = &p.primitive {
+                    self.drawn.insert(mesh.texture_id);
+                    if !self.textures.contains(&mesh.texture_id) {
+                        self.missing.push(mesh.texture_id);
+                    }
                 }
             }
             #[expect(clippy::iter_over_hash_type)]
@@ -122,11 +125,13 @@ mod tests {
     }
 
     fn input(viewport_id: ViewportId) -> RawInput {
-        RawInput {
+        let mut input = RawInput {
             viewport_id,
             screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(200.0, 100.0))),
             ..Default::default()
-        }
+        };
+        input.viewports.insert(viewport_id, ViewportInfo::default());
+        input
     }
 
     fn picture(ctx: &Context) -> TextureHandle {
@@ -151,39 +156,41 @@ mod tests {
         let pending = Rc::new(RefCell::new(PendingTextures::default()));
         let painter = Rc::new(RefCell::new(Painter::default()));
         {
-            let ctx2 = ctx.clone();
             let pending = Rc::clone(&pending);
             let painter = Rc::clone(&painter);
-            ctx.set_immediate_viewport_renderer(move |ctx, viewport: ImmediateViewport<'_>| {
-                let ImmediateViewport {
-                    ids,
-                    mut viewport_ui_cb,
-                    ..
-                } = viewport;
-                let out = ctx.run_ui(input(ids.this), |ui| viewport_ui_cb(ui));
-                let primitives = ctx2.tessellate(out.shapes, out.pixels_per_point);
-                let mut pending = pending.borrow_mut();
-                pending.append(out.textures_delta);
-                pending.without_frees(|delta| painter.borrow_mut().paint(&primitives, delta));
-            });
+            // As eframe's integrations do: each immediate viewport's pass is painted at once.
+            Context::set_immediate_viewport_renderer(
+                move |ctx, viewport: ImmediateViewport<'_>| {
+                    let ImmediateViewport {
+                        ids,
+                        mut viewport_ui_cb,
+                        ..
+                    } = viewport;
+                    let out = ctx.run_ui(input(ids.this), |ui| viewport_ui_cb(ui));
+                    let primitives = ctx.tessellate(out.shapes, out.pixels_per_point);
+                    let mut pending = pending.borrow_mut();
+                    pending.append(out.textures_delta);
+                    pending.without_frees(|delta| painter.borrow_mut().paint(&primitives, delta));
+                },
+            );
         }
 
         let shared: Rc<RefCell<Option<TextureHandle>>> = Rc::default();
         let dialog = ViewportId::from_hash_of("dialog");
-        for frame in 0..3 {
+        for _frame in 0..3 {
             let out = ctx.run_ui(input(ViewportId::ROOT), |ui| {
-                let shared = Rc::clone(&shared);
+                let drawn = Rc::clone(&shared);
                 ui.ctx().show_viewport_immediate(
                     dialog,
                     ViewportBuilder::default().with_title("dialog"),
                     move |ui, _| {
-                        if let Some(texture) = &*shared.borrow() {
+                        if let Some(texture) = &*drawn.borrow() {
                             draw(ui, texture);
                         }
                     },
                 );
-                // After the dialog's pass ended: this one's output carries it.
-                if frame == 0 {
+                // Once, after the dialog's pass ended: this one's output carries it.
+                if shared.borrow().is_none() {
                     *shared.borrow_mut() = Some(picture(ui.ctx()));
                 }
             });
@@ -197,7 +204,17 @@ mod tests {
 
         let painter = painter.borrow();
         let id = shared.borrow().as_ref().map(TextureHandle::id);
-        assert!(id.is_some_and(|id| painter.textures.contains(&id)));
+        assert!(
+            id.is_some_and(|id| painter.drawn.contains(&id)),
+            "the dialog drew it"
+        );
+        assert!(
+            id.is_some_and(|id| painter.textures.contains(&id)),
+            "{id:?} not in {:?} (drawn {:?}, missing {:?})",
+            painter.textures,
+            painter.drawn,
+            painter.missing
+        );
         assert_eq!(
             painter.missing,
             vec![],
@@ -215,9 +232,14 @@ mod tests {
         let mut pending = PendingTextures::default();
         let mut painter = Painter::default();
 
+        // Drawn in an earlier frame.
         pending.append(ctx.tex_manager().write().take_delta());
+        painter.paint(&[], pending.all());
+        assert!(painter.textures.contains(&id));
+
+        // Let go in the parent's pass, before its immediate viewport's pass ended: that
+        // viewport's paint keeps it.
         drop(texture);
-        // An immediate viewport's paint: the texture is given, not freed.
         pending.append(ctx.tex_manager().write().take_delta());
         pending.without_frees(|delta| painter.paint(&[], delta));
         assert!(painter.textures.contains(&id));

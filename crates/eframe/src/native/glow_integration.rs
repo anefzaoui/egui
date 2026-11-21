@@ -33,13 +33,13 @@ use egui::{
 use egui_winit::accesskit_winit;
 use log::warn;
 
+use super::pending_textures::PendingTextures;
 use super::{
     epi_integration, event_loop_context,
     winit_integration::{
         AccessKitActivation, EventResult, PassMode, UserEvent, WinitApp, create_egui_context,
     },
 };
-use crate::epaint::textures::TexturesDelta;
 use crate::{
     App, AppCreator, CreationContext, NativeOptions, Result, Storage,
     native::{epi_integration::EpiIntegration, winit_integration::sleep_if_invisible_or_minimized},
@@ -134,15 +134,9 @@ struct GlutinWindowContext {
 
     /// Texture changes not yet applied. Every viewport paints with the one painter, so they wait here, in the order
     /// egui made them, for whichever viewport paints next: a viewport that is not painted (a minimized root, a window
-    /// that closes) holds back no allocation another viewport's later updates need.
-    pending_delta: TexturesDelta,
-}
-
-impl Drop for GlutinWindowContext {
-    fn drop(&mut self) {
-        // Avoid debug panic when dropping unapplied deltas on teardown
-        self.pending_delta.clear();
-    }
+    /// that closes) holds back no allocation another viewport's later updates need. Freed
+    /// textures wait for the end of a top-level viewport's frame (see [`PendingTextures`]).
+    pending_delta: PendingTextures,
 }
 
 struct Viewport {
@@ -905,6 +899,8 @@ impl GlowWinitRunning<'_> {
 
         egui_winit.handle_platform_output_with_event_loop(&window, event_loop, platform_output);
 
+        // Whether this frame's textures were given to the painter by its paint.
+        let mut drawn = false;
         if is_visible {
             let clipped_primitives = integration.egui_ctx.tessellate(shapes, pixels_per_point);
 
@@ -920,8 +916,9 @@ impl GlowWinitRunning<'_> {
 
             match switched {
                 Err(error) => {
-                    // Not painted: the texture changes wait in `pending_delta`, the requested
-                    // actions in `actions_requested`, for the next paint.
+                    // Not painted: the texture changes wait in `pending_delta` for the next
+                    // paint of any window, the requested actions in `actions_requested` for this
+                    // one's.
                     paint_failed(
                         &integration.egui_ctx,
                         viewport_id,
@@ -941,12 +938,14 @@ impl GlowWinitRunning<'_> {
                         painter.clear(screen_size_in_pixels, clear_color);
                     }
 
+                    // The frame's last paint: every window's changes, the frees too.
                     painter.paint_and_update_textures(
                         screen_size_in_pixels,
                         pixels_per_point,
                         &clipped_primitives,
-                        pending_delta,
+                        pending_delta.all(),
                     );
+                    drawn = true;
 
                     {
                         let mut screenshot_callbacks = Vec::new();
@@ -1028,6 +1027,14 @@ impl GlowWinitRunning<'_> {
                     }
                 }
             }
+        }
+
+        // Not painted (hidden, minimized, or its paint failed) while its immediate viewports may
+        // have been: the textures they let go are freed now, if the context is current on one of
+        // them (deleting a texture needs a current context, on any of its surfaces). The new
+        // ones wait for whichever window paints next.
+        if !drawn && current_viewport.is_some() {
+            pending_delta.free_now(|id| painter.free_texture(id));
         }
 
         glutin.handle_viewport_output(event_loop, &integration.egui_ctx, &viewport_output);
@@ -2105,9 +2112,9 @@ fn render_immediate_viewport(
         ..
     } = &mut *glutin;
 
-    // The delta belongs to the textures all viewports share: it waits for the next paint,
-    // even when this viewport is gone.
+    // Every window's, before anything returns: another window may draw these textures.
     pending_delta.append(textures_delta);
+
     let Some(viewport) = viewports.get_mut(&viewport_id) else {
         warn!("Viewport disappeared unexpectedly!");
         return;
@@ -2130,7 +2137,7 @@ fn render_immediate_viewport(
         viewport.gl_surface.as_ref(),
     ) {
         Err(error) => {
-            // Not painted: its texture changes wait in `pending_delta` for the next paint.
+            // Not painted: the texture changes wait in `pending_delta` for the next paint.
             paint_failed(
                 egui_ctx,
                 viewport_id,
@@ -2158,12 +2165,16 @@ fn render_immediate_viewport(
                 [0.0, 0.0, 0.0, 0.0],
             );
 
-            painter.borrow_mut().paint_and_update_textures(
-                screen_size_in_pixels,
-                pixels_per_point,
-                &clipped_primitives,
-                pending_delta,
-            );
+            // Inside its parent's frame: the parent paints after it, with shapes that can use a
+            // texture freed meanwhile, so the frees wait for the parent's paint.
+            pending_delta.without_frees(|delta| {
+                painter.borrow_mut().paint_and_update_textures(
+                    screen_size_in_pixels,
+                    pixels_per_point,
+                    &clipped_primitives,
+                    delta,
+                );
+            });
 
             profiling::scope!("swap_buffers");
             set_swap_interval(

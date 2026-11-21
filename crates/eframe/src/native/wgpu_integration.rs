@@ -18,7 +18,7 @@ use winit::{
 
 use ahash::HashMap;
 use egui::{
-    DeferredViewportUiCallback, FullOutput, ImmediateViewport, OrderedViewportIdMap, TexturesDelta,
+    DeferredViewportUiCallback, FullOutput, ImmediateViewport, OrderedViewportIdMap,
     ViewportBuilder, ViewportClass, ViewportId, ViewportIdPair, ViewportIdSet, ViewportInfo,
     ViewportOutput,
 };
@@ -35,6 +35,7 @@ use crate::{
     },
 };
 
+use super::pending_textures::PendingTextures;
 use super::{
     epi_integration, event_loop_context, winit_integration,
     winit_integration::{AccessKitActivation, WinitApp},
@@ -81,6 +82,7 @@ pub struct SharedState {
     egui_ctx: egui::Context,
     viewports: Viewports,
     painter: egui_wgpu::winit::Painter,
+
     viewport_from_window: HashMap<WindowId, ViewportId>,
     focused_viewport: Option<ViewportId>,
     resized_viewport: Option<ViewportId>,
@@ -95,15 +97,9 @@ pub struct SharedState {
 
     /// Texture changes not yet applied. Every viewport paints with the one renderer, so they wait here, in the order
     /// egui made them, for whichever viewport paints next: a viewport that is not painted (a minimized root, a window
-    /// that closes) holds back no allocation another viewport's later updates need.
-    pending_delta: TexturesDelta,
-}
-
-impl Drop for SharedState {
-    fn drop(&mut self) {
-        // Avoid debug panic when dropping unapplied deltas on teardown
-        self.pending_delta.clear();
-    }
+    /// that closes) holds back no allocation another viewport's later updates need. Freed
+    /// textures wait for the end of a top-level viewport's frame (see [`PendingTextures`]).
+    pending_delta: PendingTextures,
 }
 
 pub type Viewports = egui::OrderedViewportIdMap<Viewport>;
@@ -888,7 +884,8 @@ impl WgpuWinitRunning<'_> {
                 pixels_per_point,
                 app.clear_color(&egui_ctx.global_style().visuals),
                 &clipped_primitives,
-                pending_delta,
+                // The frame's last paint: every window's changes, the frees too.
+                pending_delta.all(),
                 screenshot_commands,
                 window,
             );
@@ -920,6 +917,13 @@ impl WgpuWinitRunning<'_> {
 
             vsync_secs
         } else {
+            // Not painted (hidden, minimized) while its immediate viewports may have been: the
+            // textures they let go are freed now. The new ones wait for whichever window paints
+            // next.
+            if let Some(render_state) = painter.render_state() {
+                let mut renderer = render_state.renderer.write();
+                pending_delta.free_now(|id| renderer.free_texture(&id));
+            }
             0.0
         };
 
@@ -1387,15 +1391,19 @@ fn render_immediate_viewport(
     }
 
     let clipped_primitives = egui_ctx.tessellate(shapes, pixels_per_point);
-    painter.paint_and_update_textures(
-        ids.this,
-        pixels_per_point,
-        [0.0, 0.0, 0.0, 0.0],
-        &clipped_primitives,
-        pending_delta,
-        vec![],
-        window,
-    );
+    // Inside its parent's frame: the parent paints after it, with shapes that can use a texture
+    // freed meanwhile, so the frees wait for the parent's paint.
+    pending_delta.without_frees(|delta| {
+        painter.paint_and_update_textures(
+            ids.this,
+            pixels_per_point,
+            [0.0, 0.0, 0.0, 0.0],
+            &clipped_primitives,
+            delta,
+            vec![],
+            window,
+        )
+    });
     if core::mem::take(&mut viewport.show_after_first_paint) {
         window.set_visible(true);
     }

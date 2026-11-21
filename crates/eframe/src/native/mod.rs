@@ -14,6 +14,9 @@ pub mod file_storage;
 
 pub(crate) mod winit_integration;
 
+#[cfg(any(feature = "glow", feature = "wgpu_no_default_features"))]
+mod pending_textures;
+
 #[cfg(feature = "glow")]
 mod glow_integration;
 

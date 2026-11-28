@@ -666,9 +666,11 @@ impl Painter {
             NonZeroU32::new(inner_size.width),
             NonZeroU32::new(inner_size.height),
         ) && self.render_state.is_some()
-            && self.surfaces.get(&viewport_id).is_some_and(|s| {
-            (s.window_width, s.window_height) != (width.get(), height.get())
-        }) {
+            && self
+                .surfaces
+                .get(&viewport_id)
+                .is_some_and(|s| (s.window_width, s.window_height) != (width.get(), height.get()))
+        {
             self.resize_and_generate_depth_texture_view_and_msaa_view(viewport_id, width, height);
         }
 

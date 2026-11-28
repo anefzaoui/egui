@@ -3772,7 +3772,7 @@ fn hmonitor_size_in_pixels(
     // and GetMonitorInfoW only writes to it. A stale `hmonitor` makes the call return FALSE.
     #[expect(unsafe_code)]
     let info = unsafe {
-        let mut info: MONITORINFO = std::mem::zeroed();
+        let mut info: MONITORINFO = core::mem::zeroed();
         info.cbSize = size_of::<MONITORINFO>() as u32;
         (GetMonitorInfoW(hmonitor, &raw mut info) != 0).then_some(info)
     }?;
@@ -5423,7 +5423,7 @@ mod tests {
         }
     }
 
-    /// A monitor handle Windows no longer knows (ERROR_INVALID_MONITOR_HANDLE) has no size:
+    /// A monitor handle Windows no longer knows (`ERROR_INVALID_MONITOR_HANDLE`) has no size:
     /// the call that used to end the program, in `update_viewport_info`.
     #[cfg(target_os = "windows")]
     #[test]

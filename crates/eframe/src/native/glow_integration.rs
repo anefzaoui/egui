@@ -1494,7 +1494,13 @@ impl GlutinWindowContext {
             /// panic: no panic hook runs) and this becomes an error, for the caller to try another
             /// renderer (a computer whose only OpenGL is Windows' own 1.1, Remote Desktop).
             struct NoMatchingConfig;
-            let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            // An app built with `panic = "abort"` ends here as it did before; one that unwinds
+            // (MDM) gets the error.
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "the config picker can only refuse by unwinding"
+            )]
+            let built = std::panic::catch_unwind(core::panic::AssertUnwindSafe(|| {
                 display_builder.build(
                     event_loop,
                     config_template_builder.clone(),
